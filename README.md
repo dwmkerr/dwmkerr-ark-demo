@@ -4,7 +4,13 @@ A Helm chart for deploying model configurations to Ark for demo purposes.
 
 ## Quickstart
 
-Set your API keys as environment variables:
+```bash
+cp values.template.yaml values.yaml
+# Edit values.yaml with your API keys
+make install
+```
+
+Alternatively, set your API keys as environment variables:
 
 ```bash
 # Set API keys for the providers you want to enable
@@ -36,7 +42,7 @@ kubectl get agents
 
 ## Configuration
 
-The chart automatically enables/disables providers based on which API keys you set as environment variables. You can customize the models and base URLs by editing `chart/values.yaml` if needed.
+The chart automatically enables/disables providers based on which API keys you set as environment variables. You can customize the models and base URLs by editing `values.yaml` if needed.
 
 Default configuration includes:
 

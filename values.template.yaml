@@ -1,9 +1,10 @@
 # Model providers configuration
+# Copy this file to values.yaml and set your API keys below
 models:
-  # Anthropic provider
+  # Anthropic provider - requires ANTHROPIC_API_KEY
   anthropic:
     enabled: true
-    apiKey: ""  # Set your Anthropic API key here
+    apiKey: ""  # REQUIRED: Set your Anthropic API key (sk-ant-...)
     baseUrl: "https://api.anthropic.com/v1/"
     models:
       - name: claude-3-5-sonnet
@@ -13,10 +14,10 @@ models:
       - name: claude-4-opus
         model: claude-opus-4-20250514
 
-  # Google Gemini provider  
+  # Google Gemini provider - requires GEMINI_API_KEY
   gemini:
     enabled: true
-    apiKey: ""  # Set your Gemini API key here
+    apiKey: ""  # REQUIRED: Set your Gemini API key (AIza...)
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai/"
     models:
       - name: gemini-1-5-flash
@@ -24,18 +25,18 @@ models:
       - name: gemini-2-5-flash-lite
         model: gemini-2.5-flash-lite
 
-  # Azure OpenAI provider
+  # Azure OpenAI provider - requires AZURE_OPENAI_API_KEY
   azureOpenAI:
     enabled: true
-    apiKey: ""  # Set your Azure OpenAI API key here
-    baseUrl: "https://lxo.openai.azure.com"
+    apiKey: ""  # REQUIRED: Set your Azure OpenAI API key
+    baseUrl: "https://lxo.openai.azure.com"  # Update with your Azure endpoint
     apiVersion: "2024-12-01-preview"
-    models: []  # No models to avoid conflicts
+    models: []  # Add your deployed models here
 
-  # OpenAI provider
+  # OpenAI provider - requires OPENAI_API_KEY (optional)
   openai:
     enabled: false
-    apiKey: ""  # Set your OpenAI API key here
+    apiKey: ""  # OPTIONAL: Set your OpenAI API key (sk-...)
     baseUrl: "https://api.openai.com/v1/"
     models: []
 
@@ -67,7 +68,7 @@ teams:
 mcpServers:
   github:
     enabled: true  # Set to false to disable GitHub MCP server
-    githubToken: ""  # Set your GitHub token here
+    githubToken: ""  # REQUIRED: Set your GitHub token (ghp_...) for GitHub integration
     agent:
       enabled: true  # Set to false to disable GitHub agent
       name: github-agent
