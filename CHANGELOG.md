@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/dwmkerr/dwmkerr-ark-demo/compare/v0.1.4...v0.1.5) (2025-10-08)
+
+
+### Bug Fixes
+
+* update pr-review workflow for minio tls and tool names ([#14](https://github.com/dwmkerr/dwmkerr-ark-demo/issues/14)) ([29f0fe3](https://github.com/dwmkerr/dwmkerr-ark-demo/commit/29f0fe388326bf79f567e7980dbf5285c177e9ee))
+
 ## [0.1.4](https://github.com/dwmkerr/dwmkerr-ark-demo/compare/v0.1.3...v0.1.4) (2025-10-08)
 
 
