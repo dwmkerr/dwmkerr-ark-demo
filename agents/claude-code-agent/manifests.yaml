@@ -1,0 +1,70 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-agent
+  labels:
+    app: claude-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: claude-agent
+  template:
+    metadata:
+      labels:
+        app: claude-agent
+    spec:
+      containers:
+      - name: claude-agent
+        image: claude-agent:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 2528
+        env:
+        - name: ANTHROPIC_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: claude-code-secrets
+              key: api-key
+        - name: CLAUDE_ALLOWED_TOOLS
+          value: "Bash,Read,Edit,Write,Grep,Glob"
+        - name: CLAUDE_PERMISSION_MODE
+          value: "acceptEdits"
+        resources:
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-agent
+  labels:
+    app: claude-agent
+spec:
+  type: ClusterIP
+  ports:
+  - port: 80
+    targetPort: 2528
+    protocol: TCP
+    name: http
+  selector:
+    app: claude-agent
+---
+apiVersion: ark.mckinsey.com/v1prealpha1
+kind: A2AServer
+metadata:
+  name: claude-agent
+  annotations:
+    ark.mckinsey.com/dashboard-icon: /icons/claude.png
+spec:
+  address:
+    valueFrom:
+      serviceRef:
+        name: claude-agent
+        port: http
+  description: "Claude Code AI assistant for software engineering tasks"
