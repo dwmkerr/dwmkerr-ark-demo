@@ -2,8 +2,8 @@ apiVersion: v2
 name: ark-demo
 description: A Helm chart for dwmkerr's Ark demo models and agents
 type: application
-version: 0.1.6
-appVersion: 0.1.6
+version: 0.1.7
+appVersion: 0.1.7
 annotations:
   ark.mckinsey.com/service: ark-demo
 dependencies:
