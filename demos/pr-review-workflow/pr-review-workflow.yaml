@@ -6,14 +6,12 @@ metadata:
     workflows.argoproj.io/title: "Pull Requests Review"
     workflows.argoproj.io/description: |
       Analyzes all open pull requests in a GitHub repository using an ARK agent.
+
+      GitHub Token: If gh-token is provided, the workflow can post review comments
+      and status updates to PRs. Without a token, the workflow runs in read-only mode.
 spec:
   entrypoint: main
   serviceAccountName: argo-workflow
-
-  # Reference to artifact repository configmap
-  artifactRepositoryRef:
-    configMap: artifact-repositories
-    key: default-artifact-repository
 
   arguments:
     parameters:
@@ -26,119 +24,265 @@ spec:
       description: "GitHub repository name"
 
     - name: workspace-pvc-name
-      value: "github-mcp-workspace"
+      value: "pr-review-workflow-workspace"
       description: "Name of the PVC to use for workspace"
 
     - name: agent-name
       value: "pr-review-agent"
       description: "ARK agent name for PR operations"
 
+    - name: gh-token
+      value: ""
+      description: "GitHub token for API access. If provided, enables PR commenting and status updates."
+
+    - name: comment-on-pr
+      value: "false"
+      description: "If true, post review comments to PRs. Requires gh-token to be set."
+
+    - name: updated-since
+      value: "2000-01-01T00:00:00Z"
+      description: "Only review PRs updated since this timestamp. Format: ISO8601 (e.g., 2024-01-01T00:00:00Z)."
+
+    - name: pr-ids
+      value: ""
+      description: "Comma-separated PR IDs to review (e.g., 234,56,2). If empty, uses all open PRs matching filters."
+
   templates:
   - name: main
     dag:
       tasks:
-      - name: validate-setup
-        template: validate-setup
+      - name: prepare-and-validate
+        template: prepare-and-validate
+
+      - name: request-approval
+        template: request-approval
+        depends: "prepare-and-validate"
 
       - name: list-prs
         template: list-prs
-        dependencies: [validate-setup]
+        depends: "request-approval"
 
       - name: review-prs
         template: review-pr
-        dependencies: [list-prs]
+        depends: "list-prs"
         arguments:
           parameters:
           - name: pr-id
             value: "{{item}}"
         withParam: "{{tasks.list-prs.outputs.parameters.result}}"
-        continueOn:
-          failed: true
 
       - name: summarize-reviews
         template: summarize-reviews
-        dependencies: [review-prs]
+        depends: "review-prs.Succeeded || review-prs.Failed"
 
-  - name: validate-setup
+  - name: prepare-and-validate
     metadata:
       annotations:
-        workflows.argoproj.io/description: "Validate prerequisites"
+        workflows.argoproj.io/description: "Validate workflow parameters and prerequisites"
     script:
-      image: bitnami/kubectl:latest
-      command: [bash]
+      image: alpine/k8s:1.28.13
+      command: [sh]
+      env:
+      - name: GH_TOKEN
+        value: "{{workflow.parameters.gh-token}}"
+      volumeMounts:
+      - name: file-templates
+        mountPath: /templates
       source: |
         set -e -o pipefail
 
+        plan_file="/tmp/workflow-plan.md"
+
+        # Generate workflow plan from template using envsubst
+        export GITHUB_ORG="{{workflow.parameters.github-org}}"
+        export GITHUB_REPO="{{workflow.parameters.github-repo}}"
+        export AGENT_NAME="{{workflow.parameters.agent-name}}"
+        export WORKSPACE_PVC="{{workflow.parameters.workspace-pvc-name}}"
+        export UPDATED_SINCE="{{workflow.parameters.updated-since}}"
+        export PR_IDS="{{workflow.parameters.pr-ids}}"
+        export COMMENT_ON_PR="{{workflow.parameters.comment-on-pr}}"
+        if [ -n "{{workflow.parameters.gh-token}}" ]; then
+          export GH_TOKEN_STATUS="provided"
+        else
+          export GH_TOKEN_STATUS="not provided"
+        fi
+
+        envsubst < /templates/workflow-plan.md > "${plan_file}"
+
+        # Check that gh-token is provided if PR commenting is enabled.
+        comment_on_pr="{{workflow.parameters.comment-on-pr}}"
+        gh_token="{{workflow.parameters.gh-token}}"
+
+        if [ "${comment_on_pr}" = "true" ] && [ -z "${gh_token}" ]; then
+          echo "Error: comment-on-pr is enabled but gh-token is not set" >&2
+          echo "Please provide a GitHub token to enable PR commenting" >&2
+          exit 1
+        fi
+
+        # Verify the workspace PVC exists.
         pvc_name="{{workflow.parameters.workspace-pvc-name}}"
         echo "checking workflow pvc '${pvc_name}'..."
         kubectl get pvc "${pvc_name}"
+        echo "✓ Workspace PVC: ${pvc_name}" >> "${plan_file}"
 
-        mcp_servers="github shell-mcp"
+        # Verify required MCP servers are installed.
+        echo "" >> "${plan_file}"
+        echo "## Required MCP Servers" >> "${plan_file}"
+        mcp_servers="github"
         for mcp_server in ${mcp_servers}; do
           echo "checking mcp server '${mcp_server}'..."
           kubectl get mcpserver "${mcp_server}"
+          echo "✓ ${mcp_server}" >> "${plan_file}"
         done
 
+        # Verify the PR review agent exists.
         agent_name="{{workflow.parameters.agent-name}}"
         echo "checking agent '${agent_name}'..."
         kubectl get agent "${agent_name}"
+        echo "" >> "${plan_file}"
+        echo "## Agent Configuration" >> "${plan_file}"
+        echo "✓ Agent: ${agent_name}" >> "${plan_file}"
+
+        # Write workflow actions
+        echo "" >> "${plan_file}"
+        echo "## Planned Actions" >> "${plan_file}"
+        if [ -n "{{workflow.parameters.pr-ids}}" ]; then
+          echo "- Review specific PRs: {{workflow.parameters.pr-ids}}" >> "${plan_file}"
+        else
+          echo "- Review all open PRs updated since {{workflow.parameters.updated-since}}" >> "${plan_file}"
+        fi
+
+        if [ "${comment_on_pr}" = "true" ]; then
+          echo "- Post review comments to PRs (enabled)" >> "${plan_file}"
+        else
+          echo "- Read-only review (commenting disabled)" >> "${plan_file}"
+        fi
+
+        # Check token scopes for dangerous permissions
+        echo "" >> "${plan_file}"
+        echo "## Token Permissions" >> "${plan_file}"
+
+        dangerous_scopes_found=""
+
+        if [ -z "$GH_TOKEN" ]; then
+          echo "- No GitHub token provided" >> "${plan_file}"
+        else
+          # Install gh CLI
+          apk add --no-cache github-cli >/dev/null 2>&1
+
+          # Get token scopes
+          echo "Checking GitHub token scopes..."
+          if gh api user -i > /tmp/gh-response.txt 2>&1; then
+            scopes=$(grep -i "x-oauth-scopes:" /tmp/gh-response.txt | cut -d: -f2- | xargs || echo "")
+
+            if [ -n "$scopes" ]; then
+              echo "Token scopes: $scopes"
+
+              # Define dangerous scopes
+              dangerous_list="repo delete_repo admin:org admin:public_key admin:repo_hook admin:gpg_key workflow"
+
+              # Check each dangerous scope
+              for dangerous_scope in $dangerous_list; do
+                if echo "$scopes" | grep -qw "$dangerous_scope"; then
+                  echo "⚠️  FOUND: Token has '$dangerous_scope' scope"
+                  if [ -z "$dangerous_scopes_found" ]; then
+                    dangerous_scopes_found="$dangerous_scope"
+                  else
+                    dangerous_scopes_found="$dangerous_scopes_found,$dangerous_scope"
+                  fi
+                fi
+              done
+
+              if [ -n "$dangerous_scopes_found" ]; then
+                echo "- ⚠️  **Elevated permissions detected:** \`$dangerous_scopes_found\`" >> "${plan_file}"
+                echo "- These scopes exceed what's needed for PR reviews" >> "${plan_file}"
+                echo "- **Recommended scopes:** \`public_repo,read:org\`" >> "${plan_file}"
+              else
+                echo "- ✓ Token scopes are appropriate for PR reviews" >> "${plan_file}"
+              fi
+            else
+              echo "- WARNING: Could not determine token scopes" >> "${plan_file}"
+            fi
+          else
+            echo "- WARNING: Failed to validate token scopes" >> "${plan_file}"
+          fi
+        fi
+
+        # Save dangerous scopes for output parameter
+        echo "$dangerous_scopes_found" > /tmp/dangerous-scopes.txt
+
+        echo "Workflow parameters and prerequisites validated successfully"
+        cat "${plan_file}"
+    outputs:
+      parameters:
+      - name: dangerous-scopes
+        valueFrom:
+          path: /tmp/dangerous-scopes.txt
+      artifacts:
+      - name: workflow-plan
+        path: /tmp/workflow-plan.md
+        archive:
+          none: {}
+    volumes:
+    - name: file-templates
+      configMap:
+        name: pr-review-file-templates
+
+  - name: request-approval
+    metadata:
+      annotations:
+        workflows.argoproj.io/description: |
+          Review and approve the workflow plan before proceeding.
+
+          The workflow plan includes:
+          - Repository and configuration details
+          - Token permissions (including any elevated scopes)
+          - Validated resources
+          - Planned actions
+
+          Review the 'workflow-plan' artifact to see the complete plan.
+
+          To approve and continue: argo resume {{workflow.name}}
+          To reject and terminate: argo terminate {{workflow.name}}
+    suspend: {}
 
   - name: list-prs
     metadata:
       annotations:
-        workflows.argoproj.io/description: "List open PRs using agent"
+        workflows.argoproj.io/description: "List open PRs using GitHub API or explicit PR IDs"
     script:
-      image: bitnami/kubectl:latest
-      command: [bash]
+      image: alpine/k8s:1.28.13
+      command: [sh]
+      env:
+      - name: GH_TOKEN
+        value: "{{workflow.parameters.gh-token}}"
       source: |
         set -e -o pipefail
-        query_name="{{workflow.name}}-list-prs"
 
-        # Create Query to list PRs
-        kubectl create -f - <<EOF >&2
-        apiVersion: ark.mckinsey.com/v1alpha1
-        kind: Query
-        metadata:
-          name: ${query_name}
-          annotations:
-            ark.mckinsey.com/workflow-name: "{{workflow.name}}"
-        spec:
-          input: |
-            List all open pull requests for repository {{workflow.parameters.github-org}}/{{workflow.parameters.github-repo}}.
-            Return ONLY a JSON array of PR numbers. Format: [1, 2, 3]
-          targets:
-          - type: agent
-            name: {{workflow.parameters.agent-name}}
-          timeout: 5m
-        EOF
+        pr_ids="{{workflow.parameters.pr-ids}}"
 
-        # Wait for completion.
-        # TODO: this is the most painful part at the moment, we have to poll, we
-        # can't use kubectl wait, very painful.
-        # We could use 'ark query --wait' or something?
-        # We could use 'ark wait ??'
-        # Can we use a similar metholodology for HITL?
-        timeout=300
-        elapsed=0
-        while [ ${elapsed} -lt ${timeout} ]; do
-          phase=$(kubectl get query "${query_name}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-          if [ "${phase}" = "done" ]; then
-            break
-          elif [ "${phase}" = "error" ]; then
-            echo "Query failed with error" >&2
-            exit 1
+        if [ -n "$pr_ids" ]; then
+          # Use explicitly provided PR IDs, convert to JSON array.
+          echo "$pr_ids" | tr ',' '\n' | jq -R . | jq -s 'map(tonumber)' > /tmp/pr-list.json
+          echo "Using $(jq 'length' /tmp/pr-list.json) explicitly specified PRs"
+        else
+          # Query GitHub API for all open PRs.
+          apk add --no-cache curl
+
+          # Build authorization header if token provided.
+          auth_header=""
+          if [ -n "$GH_TOKEN" ]; then
+            auth_header="Authorization: Bearer $GH_TOKEN"
           fi
-          sleep 2
-          elapsed=$((elapsed + 2))
-        done
-        if [ ${elapsed} -ge ${timeout} ]; then
-          echo "Query timed out after ${timeout}s" >&2
-          exit 1
-        fi
 
-        # Get result and write to output file
-        pr_list=$(kubectl get query "${query_name}" -o jsonpath='{.status.responses[0].content}')
-        echo "${pr_list}" > /tmp/pr-list.json
+          # Fetch open PRs from GitHub API.
+          curl -sS -H "$auth_header" \
+            "https://api.github.com/repos/{{workflow.parameters.github-org}}/{{workflow.parameters.github-repo}}/pulls?state=open&per_page=100" \
+            | jq --arg since "{{workflow.parameters.updated-since}}" \
+              '[.[] | select(.updated_at > $since) | .number]' > /tmp/pr-list.json
+
+          echo "Found $(jq 'length' /tmp/pr-list.json) open PRs"
+        fi
     outputs:
       parameters:
       - name: result
@@ -158,75 +302,89 @@ spec:
       parameters:
       - name: pr-id
     script:
-      image: bitnami/kubectl:latest
-      command: [bash]
+      image: alpine/k8s:1.28.13
+      command: [sh]
       volumeMounts:
       - name: workspace
         mountPath: /workspace
       source: |
         set -e -o pipefail
+
+        # Generate unique names and paths for this PR review.
         pr_id="{{inputs.parameters.pr-id}}"
         workflow_id="{{workflow.name}}"
         query_name="${workflow_id}-review-pr-${pr_id}"
         workspace_path="/workspace/${workflow_id}/${pr_id}"
 
-        # Create Query to review PR with explicit workspace instructions
+        # Create Query to review PR, with instructions to use the workspace.
         kubectl create -f - <<EOF >&2
         apiVersion: ark.mckinsey.com/v1alpha1
         kind: Query
         metadata:
           name: ${query_name}
+          labels:
+            workflow: "{{workflow.name}}"
           annotations:
             ark.mckinsey.com/workflow-name: "{{workflow.name}}"
         spec:
           input: |
             Review pull request #${pr_id} in repository {{workflow.parameters.github-org}}/{{workflow.parameters.github-repo}}.
 
-            IMPORTANT: Use the following workflow:
-            1. First, create the workspace directory: use execute-shell-command with 'mkdir' and args ['-p', '${workspace_path}']
-            2. Change to that directory: use execute-shell-command with 'cd' and args ['${workspace_path}']
-            3. Analyze the pull request using GitHub tools
-            4. Write your review to ${workspace_path}/review.md using execute-shell-command with 'bash' and args ['-c', 'cat > ${workspace_path}/review.md << EOF
-            <your review content here>
-            EOF']
+            Analyze the pull request and provide a review in Markdown format.
 
             Your review should include:
             1. PR summary and purpose
             2. Key changes
             3. Potential issues or concerns
             4. Recommendations for reviewers
-
-            Format: Markdown
           targets:
           - type: agent
             name: {{workflow.parameters.agent-name}}
+          sessionId: {{workflow.name}}
           timeout: 10m
+          ttl: 24h
         EOF
 
-        # Wait for completion
-        timeout=600
-        elapsed=0
-        while [ ${elapsed} -lt ${timeout} ]; do
-          phase=$(kubectl get query "${query_name}" -o jsonpath='{.status.phase}' 2>/dev/null || echo "")
-          if [ "${phase}" = "done" ]; then
-            break
-          elif [ "${phase}" = "error" ]; then
+        # Wait for query completion (success or failure).
+        kubectl wait --for=condition=Completed \
+          --timeout=10m query/${query_name}
+
+        # Check if query failed with rate limit error.
+        phase=$(kubectl get query "${query_name}" -o jsonpath='{.status.phase}')
+        if [ "${phase}" = "error" ]; then
+          error_msg=$(kubectl get query "${query_name}" -o jsonpath='{.status.responses[0].raw}')
+          if echo "${error_msg}" | grep -q "429\|RateLimitReached"; then
+            echo "Rate limit hit, waiting 30s and retrying..." >&2
+            sleep 30
+
+            # Reset query by replacing without status to trigger reprocessing.
+            kubectl get query "${query_name}" -o json | \
+              jq 'del(.status)' | \
+              kubectl replace -f -
+
+            kubectl wait --for=condition=Completed \
+              --timeout=10m query/${query_name}
+            phase=$(kubectl get query "${query_name}" -o jsonpath='{.status.phase}')
+          fi
+
+          # Exit if still failed.
+          if [ "${phase}" = "error" ]; then
             echo "Query failed with error" >&2
             exit 1
           fi
-          sleep 2
-          elapsed=$((elapsed + 2))
-        done
-        if [ ${elapsed} -ge ${timeout} ]; then
-          echo "Query timed out after ${timeout}s" >&2
-          exit 1
         fi
 
-        # Verify workspace structure
-        [ -d "${workspace_path}" ] || { echo "Workspace directory not found: ${workspace_path}" >&2; exit 1; }
-        [ -f "${workspace_path}/review.md" ] || { echo "Review file not found: ${workspace_path}/review.md" >&2; exit 1; }
+        # Get review content from query response.
+        review_content=$(kubectl get query "${query_name}" -o jsonpath='{.status.responses[0].content}')
 
-        # Read review from workspace
+        # Create workspace directory and write review.
+        mkdir -p "${workspace_path}"
+        echo "${review_content}" > "${workspace_path}/review.md"
+
+        # Verify file was written.
+        [ -f "${workspace_path}/review.md" ] || { echo "Failed to write review file" >&2; exit 1; }
+
+        # Output the review for workflow artifacts.
         cat "${workspace_path}/review.md" | tee /tmp/review-summary.txt
     volumes:
     - name: workspace
@@ -248,13 +406,15 @@ spec:
       annotations:
         workflows.argoproj.io/description: "Summarize all PR reviews from workspace"
     script:
-      image: bitnami/kubectl:latest
-      command: [bash]
+      image: alpine/k8s:1.28.13
+      command: [sh]
       volumeMounts:
       - name: workspace
         mountPath: /workspace
       source: |
         set -e -o pipefail
+
+        # Find all review files in the workspace.
         workflow_id="{{workflow.name}}"
         workspace_path="/workspace/${workflow_id}"
 
@@ -278,3 +438,138 @@ spec:
         path: /tmp/summary.txt
         archive:
           none: {}
+---
+# Workspace PVC for sharing data between workflow steps.
+# The agent writes PR reviews to this shared workspace, and the summarize step reads them.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: pr-review-workflow-workspace
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+---
+# PR Review Agent with GitHub and shell MCP tools.
+# This agent can interact with GitHub APIs and execute shell commands to analyze PRs.
+apiVersion: ark.mckinsey.com/v1alpha1
+kind: Agent
+metadata:
+  name: pr-review-agent
+spec:
+  modelRef:
+    name: default
+
+  prompt: |
+    You are a PR review assistant. You help analyze GitHub pull requests by:
+    1. Listing open PRs in repositories
+    2. Cloning repositories and checking out specific PRs
+    3. Analyzing code changes
+
+  tools:
+  - name: github-add-comment-to-pending-review
+    type: custom
+  - name: github-add-issue-comment
+    type: custom
+  - name: github-assign-copilot-to-issue
+    type: custom
+  - name: github-create-branch
+    type: custom
+  - name: github-create-or-update-file
+    type: custom
+  - name: github-create-pull-request
+    type: custom
+  - name: github-create-repository
+    type: custom
+  - name: github-delete-file
+    type: custom
+  - name: github-fork-repository
+    type: custom
+  - name: github-get-commit
+    type: custom
+  - name: github-get-file-contents
+    type: custom
+  - name: github-get-label
+    type: custom
+  - name: github-get-latest-release
+    type: custom
+  - name: github-get-me
+    type: custom
+  - name: github-get-release-by-tag
+    type: custom
+  - name: github-get-tag
+    type: custom
+  - name: github-get-team-members
+    type: custom
+  - name: github-get-teams
+    type: custom
+  - name: github-issue-read
+    type: custom
+  - name: github-issue-write
+    type: custom
+  - name: github-list-branches
+    type: custom
+  - name: github-list-commits
+    type: custom
+  - name: github-list-issue-types
+    type: custom
+  - name: github-list-issues
+    type: custom
+  - name: github-list-pull-requests
+    type: custom
+  - name: github-list-releases
+    type: custom
+  - name: github-list-tags
+    type: custom
+  - name: github-merge-pull-request
+    type: custom
+  - name: github-pull-request-read
+    type: custom
+  - name: github-pull-request-review-write
+    type: custom
+  - name: github-push-files
+    type: custom
+  - name: github-request-copilot-review
+    type: custom
+  - name: github-search-code
+    type: custom
+  - name: github-search-issues
+    type: custom
+  - name: github-search-pull-requests
+    type: custom
+  - name: github-search-repositories
+    type: custom
+  - name: github-search-users
+    type: custom
+  - name: github-sub-issue-write
+    type: custom
+  - name: github-update-pull-request
+    type: custom
+  - name: github-update-pull-request-branch
+    type: custom
+---
+# ConfigMap containing the workflow plan template.
+# The template uses shell variable syntax (${VAR}) which gets replaced
+# by envsubst in the prepare-and-validate step.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pr-review-file-templates
+data:
+  workflow-plan.md: |
+    # PR Review Workflow Plan
+
+    ## Workflow Configuration
+    - Organization: ${GITHUB_ORG}
+    - Repository: ${GITHUB_REPO}
+    - Agent: ${AGENT_NAME}
+    - Workspace PVC: ${WORKSPACE_PVC}
+
+    ## Parameters
+    - Updated Since: ${UPDATED_SINCE}
+    - PR IDs: ${PR_IDS}
+    - Comment on PR: ${COMMENT_ON_PR}
+    - GitHub Token: ${GH_TOKEN_STATUS}
