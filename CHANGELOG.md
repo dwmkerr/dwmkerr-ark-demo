@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.7](https://github.com/dwmkerr/ark-demo/compare/v0.1.6...v0.1.7) (2025-11-21)
+
+
+### Bug Fixes
+
+* resolve merge conflict - keep dwmkerr-ark-demo as release name ([2e8517e](https://github.com/dwmkerr/ark-demo/commit/2e8517e2676de31d84f541a900e8d388a7799d38))
+* use dwmkerr-ark-demo as helm release name in Makefile ([0705f71](https://github.com/dwmkerr/ark-demo/commit/0705f713548c46140ac5b19714a96f660a4fec5f))
+
 ## [0.1.6](https://github.com/dwmkerr/ark-demo/compare/v0.1.5...v0.1.6) (2025-10-29)
 
 
